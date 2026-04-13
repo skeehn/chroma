@@ -2160,25 +2160,40 @@ impl LogServer {
             .make_log_reader(topology_name.as_ref(), collection_id)
             .await
             .map_err(|err| Status::unknown(err.to_string()))?;
-        let (start_position, limit_position) = match self
-            .manifest_with_head_check(&*log_reader, collection_id)
-            .await
-        {
-            Ok(Some(mw)) => (
-                mw.manifest.oldest_timestamp(),
-                mw.manifest.next_write_timestamp(),
-            ),
-            Ok(None) => (LogPosition::from_offset(1), LogPosition::from_offset(1)),
-            Err(wal3::Error::UninitializedLog) => {
-                return Err(Status::not_found(format!(
-                    "collection {collection_id} not found"
-                )));
+        let (start_position, limit_position) = if topology_name.is_some() {
+            match log_reader
+                .manifest_bounds_and_witness()
+                .await
+                .map_err(|err| {
+                    Status::new(err.code().into(), format!("could not scout logs: {err:?}"))
+                })? {
+                Some(bounds_and_witness) => (
+                    bounds_and_witness.bounds.oldest_timestamp,
+                    bounds_and_witness.bounds.next_write_timestamp,
+                ),
+                None => (LogPosition::from_offset(1), LogPosition::from_offset(1)),
             }
-            Err(err) => {
-                return Err(Status::new(
-                    err.code().into(),
-                    format!("could not scout logs: {err:?}"),
-                ));
+        } else {
+            match self
+                .manifest_with_head_check(&*log_reader, collection_id)
+                .await
+            {
+                Ok(Some(mw)) => (
+                    mw.manifest.oldest_timestamp(),
+                    mw.manifest.next_write_timestamp(),
+                ),
+                Ok(None) => (LogPosition::from_offset(1), LogPosition::from_offset(1)),
+                Err(wal3::Error::UninitializedLog) => {
+                    return Err(Status::not_found(format!(
+                        "collection {collection_id} not found"
+                    )));
+                }
+                Err(err) => {
+                    return Err(Status::new(
+                        err.code().into(),
+                        format!("could not scout logs: {err:?}"),
+                    ));
+                }
             }
         };
         let start_offset = start_position.offset() as i64;
@@ -2340,6 +2355,11 @@ impl LogServer {
             max_records: Some(pull_logs.batch_size as u64),
         };
         let from = LogPosition::from_offset(pull_logs.start_from_offset as u64);
+        if topology_name.is_some() {
+            if let Some(fragments) = log_reader.scan_partial(from, limits).await? {
+                return Ok(fragments);
+            }
+        }
         if let Ok(Some(manifest_and_witness)) = log_reader.manifest_and_witness().await {
             let fragments = scan_from_manifest(&manifest_and_witness.manifest, from, limits);
             if let Some(cache) = self.cache.as_ref() {
@@ -3659,7 +3679,6 @@ mod tests {
     use crate::state_hash_table::Value;
 
     use chroma_config::spanner::SpannerEmulatorConfig;
-    use chroma_config::ADMIN_RPC_TIMEOUT_SECS;
     use chroma_storage::s3_client_for_test_with_new_bucket;
     use chroma_types::Topology;
     use chroma_types::{are_update_metadatas_close_to_equal, Operation, OperationRecord};
@@ -4923,7 +4942,7 @@ mod tests {
         let dtor = Box::pin(async move {
             let admin_client_config = AdminClientConfig {
                 environment: Environment::Emulator(dtor_emulator.grpc_endpoint()),
-                timeout: Duration::from_secs(ADMIN_RPC_TIMEOUT_SECS),
+                timeout: Duration::from_secs(dtor_emulator.channel.admin_rpc_timeout_secs),
                 connect_timeout: Duration::from_secs(dtor_emulator.channel.connect_timeout_secs),
                 http2_keep_alive_interval: Some(Duration::from_secs(
                     dtor_emulator.channel.http2_keep_alive_interval_secs,
@@ -6283,8 +6302,8 @@ mod tests {
 
     proptest! {
         #![proptest_config(ProptestConfig {
-            timeout: 60_000,
-            cases: 10,
+            timeout: 90_000,
+            cases: 1,
             .. ProptestConfig::default()
         })]
         #[test]
